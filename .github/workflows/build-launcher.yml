@@ -62,19 +62,28 @@ jobs:
           $hash = (Get-FileHash $exe -Algorithm SHA256).Hash
           Write-Host "sha256: $hash"
           "$hash  DeepSeekHarness.exe" | Out-File -Encoding ascii DeepSeekHarness.exe.sha256
-          # restore the WebView2 runtime files next to the exe so the artifact is runnable
-          Copy-Item 'launcher/wv2pkg/pkg/lib/net462/*.dll' . -Force -ErrorAction SilentlyContinue
-          Copy-Item 'launcher/wv2pkg/pkg/build/native/x64/WebView2Loader.dll' . -Force -ErrorAction SilentlyContinue
+          # WebView2 runtime files must ship with the exe. `Copy-Item` does not
+          # expand wildcards in -Path, so glob explicitly (a literal '*.dll' path
+          # silently copies nothing).
+          $wv2 = 'launcher/wv2pkg/pkg'
+          Copy-Item (Get-ChildItem "$wv2/lib/net462/*.dll" | Select-Object -Expand FullName) . -Force
+          Copy-Item "$wv2/build/native/x64/WebView2Loader.dll" . -Force
+          Copy-Item 'DeepSeekHarness.exe.config' . -Force -ErrorAction SilentlyContinue
+          $ship = Get-ChildItem 'DeepSeekHarness.exe','DeepSeekHarness.exe.sha256','WebView2Loader.dll','Microsoft.Web.WebView2.*.dll' -ErrorAction SilentlyContinue
+          $ship | ForEach-Object { Write-Host ("ship: {0} ({1} bytes)" -f $_.Name, $_.Length) }
+          if (-not (Test-Path 'Microsoft.Web.WebView2.WinForms.dll')) { throw 'WebView2 managed assemblies missing from the artifact' }
+          if (-not (Test-Path 'WebView2Loader.dll')) { throw 'WebView2Loader.dll missing from the artifact' }
 
       - uses: actions/upload-artifact@v4
         with:
           name: DeepSeekHarness-win-x64
           path: |
             DeepSeekHarness.exe
-            DeepSeekHarness.exe.config
             DeepSeekHarness.exe.sha256
-            Microsoft.Web.WebView2.*.dll
+            Microsoft.Web.WebView2.Core.dll
+            Microsoft.Web.WebView2.WinForms.dll
             WebView2Loader.dll
+            launcher/wv2pkg/pkg/lib/net462/Microsoft.Web.WebView2.Wpf.dll
           if-no-files-found: error
           retention-days: 30
 
