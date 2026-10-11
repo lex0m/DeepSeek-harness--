@@ -1,0 +1,95 @@
+name: build-launcher
+
+# Compiles DeepSeekHarness.exe on real Windows and publishes it as an artifact.
+# This is the authoritative build: it uses the same legacy csc.exe build.ps1 does,
+# which is the only toolchain that matches the shipped exe (C# 5, .NET Framework 4.8).
+#
+# Why this exists: the launcher must be rebuildable without a local Windows dev box
+# (the maintainer's phone cannot run csc.exe). A green run of this workflow is also
+# the only automated verification the project has.
+
+on:
+  push:
+    branches: ['**']
+    paths:
+      - 'launcher/**'
+      - 'bootstrap.ps1'
+      - 'start.ps1'
+      - 'update.ps1'
+      - '.github/workflows/build-launcher.yml'
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch WebView2 SDK (not committed to the repo)
+        shell: pwsh
+        run: ./launcher/bootstrap-webview2.ps1
+
+      - name: Build with the legacy csc.exe (same flags as the shipped exe)
+        shell: pwsh
+        run: ./launcher/build.ps1
+
+      - name: Verify the artifact
+        shell: pwsh
+        run: |
+          $exe = 'DeepSeekHarness.exe'
+          $item = Get-Item $exe
+          Write-Host "size: $($item.Length) bytes"
+          # shipped exes are ~85-95 KB; a much smaller file means the old sources were compiled
+          if ($item.Length -lt 60KB) { throw "unexpectedly small exe: $($item.Length) bytes" }
+
+          $bytes = [System.IO.File]::ReadAllBytes($exe)
+          $ascii = [System.Text.Encoding]::ASCII.GetString($bytes)
+          if ($ascii -notmatch 'PerMonitorV2') { throw 'app.manifest (PerMonitorV2) is not embedded' }
+
+          # PE / CLI header sanity: catch an accidental DLL-style output
+          if ($bytes[0] -ne 0x4D -or $bytes[1] -ne 0x5A) { throw 'not a PE image' }
+          $peOff = [BitConverter]::ToInt32($bytes, 0x3C)
+          if ($ascii.Substring($peOff, 2) -ne 'PE') { throw 'PE signature missing' }
+
+          # Load managed metadata: a real assembly check, works even without a desktop session
+          $asm = [System.Reflection.AssemblyName]::GetAssemblyName((Resolve-Path $exe))
+          Write-Host "assembly: $($asm.FullName)"
+
+          $hash = (Get-FileHash $exe -Algorithm SHA256).Hash
+          Write-Host "sha256: $hash"
+          "$hash  DeepSeekHarness.exe" | Out-File -Encoding ascii DeepSeekHarness.exe.sha256
+          # restore the WebView2 runtime files next to the exe so the artifact is runnable
+          Copy-Item 'launcher/wv2pkg/pkg/lib/net462/*.dll' . -Force -ErrorAction SilentlyContinue
+          Copy-Item 'launcher/wv2pkg/pkg/build/native/x64/WebView2Loader.dll' . -Force -ErrorAction SilentlyContinue
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DeepSeekHarness-win-x64
+          path: |
+            DeepSeekHarness.exe
+            DeepSeekHarness.exe.config
+            DeepSeekHarness.exe.sha256
+            Microsoft.Web.WebView2.*.dll
+            WebView2Loader.dll
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: DeepSeekHarness-win-x64
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            DeepSeekHarness.exe
+            DeepSeekHarness.exe.sha256
