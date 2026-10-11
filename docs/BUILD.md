@@ -87,3 +87,21 @@ $exe = 'DeepSeekHarness.exe'
 - `[未验证]` CI 首次运行（还从没在 Actions 上跑过）；
 - `[未验证]` proot + dotnet SDK + 交叉编译脚本在本机（Android 15 / aarch64）的实际结果；
 - `[未验证]` `bootstrap-webview2.ps1` 在 PowerShell 5.1 下的落盘结构（本机无 Windows/PowerShell）。
+
+## 6. CI 实测记录（2026-10-11，跑在真 Windows runner 上）
+
+| run | 结论 | 关键数字 |
+|---|---|---|
+| 第一次（workflow 首跑） | ✅ | exe **91648 B**；artifact 压缩后 323308 B / 6 files；`PerMonitorV2`、PE 头、程序集元数据全部通过 |
+| 第二次（修 artifact 缺文件） | ✅ | 显式 glob 后 WebView2 三个文件 + loader 进包：`WebView2Loader.dll 165968` / `Core.dll 603712` / `WinForms.dll 38488` |
+| 第三次（加 `/deterministic`） | ❌ | **`fatal error CS2007: Unrecognized option: '/deterministic'`** —— 老 csc.exe 不认这个开关（Roslyn 才有），已撤回 |
+| 第四次（P0 权限修复） | ✅ | exe **93696 B**（+2KB 即新增逻辑），sha256 `9E338AB2…`，artifact 324213 B |
+
+**可复现性**：第一次与第二次的源码完全相同，但 sha256 不同（`30092076…` → `336392C2…`）——
+即老 csc.exe 的产物**不可复现**（PE 时间戳/MVID 随机）。以后比对版本请比**源码 + 功能**，不要比 hash；
+真要可复现构建，得把工具链换成 Roslyn（`dotnet build` 或 VS Build Tools 的 csc）。
+
+**P0 修复已过 Windows 编译器**：`Services.cs` 新增的 `ProfilePatchPath` / `TryUpsertPermissionPreset` /
+`PatchHasPermissionDefault` / `AtomicWriteAllText` 在 legacy csc（C# 5 语法）下编译零 error 零 warning。
+其算法另有等价 Python 镜像测试（4 种 patch 形态：无条目 / 有配置插入 / 已有 defaultPreset 跳过 /
+config 里已有 presets 时插到首位），断言"只增不删、`- id:` 不重复、YAML 合法"。
