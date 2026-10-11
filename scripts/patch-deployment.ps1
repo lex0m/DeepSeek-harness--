@@ -45,7 +45,10 @@ $files = @(
   @{ src = Join-Path $RepoRoot 'scripts\start-model-server.ps1'; dst = Join-Path $DeployScripts 'start-model-server.ps1' },
   @{ src = Join-Path $RepoRoot 'update.ps1';                    dst = Join-Path $Deployment 'update.ps1' },
   @{ src = Join-Path $RepoRoot 'bootstrap.ps1';                 dst = Join-Path $Deployment 'bootstrap.ps1' },
-  @{ src = Join-Path $RepoRoot 'start.ps1';                     dst = Join-Path $Deployment 'start.ps1' }
+  @{ src = Join-Path $RepoRoot 'start.ps1';                     dst = Join-Path $Deployment 'start.ps1' },
+  # 冻结的 exe（含 DSH_PERMISSION 写 profile patch 的修复）；缺失时跳过并提示
+  @{ src = Join-Path $RepoRoot 'DeepSeekHarness.exe';            dst = Join-Path $Deployment 'DeepSeekHarness.exe' },
+  @{ src = Join-Path $RepoRoot 'DeepSeekHarness.exe.config';     dst = Join-Path $Deployment 'DeepSeekHarness.exe.config' }
 )
 foreach ($f in $files) {
   if (-not (Test-Path $f.src)) { Write-Host "  skip (not in repo): $($f.src)" -ForegroundColor Yellow; continue }
