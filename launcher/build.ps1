@@ -36,8 +36,9 @@ $RefArgs = @()
 foreach ($r in $Refs) { $RefArgs += "/reference:$r" }
 
 Write-Host "==> Compiling DeepSeekHarness.exe [asInvoker] ..."
-# /deterministic: 相同输入产出相同 exe（PE 时间戳/MVID 固定），便于比对与回滚
-& $Csc /nologo /target:winexe /platform:x64 /optimize+ /deterministic /win32manifest:"$Manifest" /out:$Out $RefArgs $Sources
+# 注意：老版 csc.exe（v4.0.30319）不支持 /deterministic（那是 Roslyn 的开关，实测会 fatal error CS2007），
+# 所以本构建**不可复现**：同样的源码两次编译出来的 exe 字节不同（PE 时间戳/MVID）。要可复现得改用 Roslyn。
+& $Csc /nologo /target:winexe /platform:x64 /optimize+ /win32manifest:"$Manifest" /out:$Out $RefArgs $Sources
 if ($LASTEXITCODE -ne 0) { throw "Compile failed with code $LASTEXITCODE" }
 
 Write-Host "==> Done: $Out ($((Get-Item $Out).Length) bytes)"
