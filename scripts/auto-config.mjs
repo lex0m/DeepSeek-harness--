@@ -29,6 +29,15 @@ import path from 'node:path';
 const DSH_HOME    = process.env.DSH_HOME || path.join(process.cwd(), 'home');
 const SETTINGS    = path.join(DSH_HOME, 'settings.yaml');
 const CREDENTIALS = path.join(DSH_HOME, '.credentials.yaml');
+// dsh >= 0.2 moved live plugin config out of $DSH_HOME/settings.yaml: the file
+// is imported once into the active profile and renamed `settings.yaml.imported`,
+// and everything afterwards is persisted per profile entry in the profile's own
+// cordis.patch.yml. `llm-pi-ai` was never one of the importable sections, so a
+// settings.yaml written after that import is ignored outright. providers and the
+// model fallback therefore go into the profile patch now.
+const PROFILE     = process.env.DSH_PROFILE || 'web';
+const PROFILE_DIR = path.join(DSH_HOME, 'profiles', PROFILE);
+const PATCH       = path.join(PROFILE_DIR, 'cordis.patch.yml');
 
 const TIMEOUT_MS  = 2500;
 const MAX_MODELS  = 200;
@@ -192,14 +201,17 @@ function readTopLevelSections(text) {
 // Parse the providers dict inside an "llm-pi-ai:" section (4-space keys).
 // Returns null when the block does not follow the shape we emit, otherwise
 // a Map of providerId -> verbatim block text.
-function parseProvidersBlock(blockText) {
+function parseProvidersBlock(blockText, baseIndent = 4) {
   const lines = blockText.split('\n');
   const out = new Map();
   let curKey = null;
   let curLines = [];
   let sawProvider = false;
   for (const line of lines) {
-    const m = /^    ([^#\s][^:]*):\s*$/.exec(line);
+    // (?:...) not (...): the group expression must not capture, and `[^:]`
+    // would happily match the padding spaces of a structural line such as
+    // `  providers:`, turning it into a bogus provider key.
+    const m = new RegExp('^ {' + baseIndent + '}([^#\\s][^:\\s][^:]*):\\s*$').exec(line);
     if (m) {
       if (curKey) out.set(curKey, curLines.join('\n'));
       curKey = m[1].trim();
@@ -208,18 +220,40 @@ function parseProvidersBlock(blockText) {
     } else if (curKey) {
       curLines.push(line);
     } else if (line.trim() !== '') {
-      // Before the first provider: allow only the section header
-      // ("llm-pi-ai:" at col 0) and "  providers:" (indent 2).
-      // Anything else (extra config at indent 2) means a shape we do
-      // not own -> return null so the caller backs up instead of clobbering.
-      if (/^[A-Za-z0-9_.-]+:\s*$/.test(line)) continue; // section header
-      if (/^\s+providers:\s*$/.test(line)) continue;      // providers: line
+      // Before the first provider key we accept exactly two bare headers: the
+      // section header at column 0 (`llm-pi-ai:`) and the `providers:` line at
+      // one indent level. Anything else means a shape we do not own -> return
+      // null so the caller backs up instead of clobbering it.
+      // Two bugs lived here: a loose `^\s+providers:` also matches an
+      // ordinary provider key, and the key regex `[^:]` happily matched the
+      // padding spaces of `  providers:`. Both made the parser treat a
+      // structural line as a provider key and drop the whole block.
+      const indent = /^ */.exec(line)[0].length;
+      if (indent === 0 && /^[A-Za-z0-9_.-]+:\s*$/.test(line)) continue;      // section header
+      if (indent === 2 && /^ *providers:\s*$/.test(line)) continue;         // providers: (indent 2 always)
       return null;
     }
   }
+  // Trailing blank/comment lines belong to the document, not to the last
+  // provider: keep them out so a refresh cannot re-emit a stale marker or a
+  // stray comment. A detached comment is dropped (the fresh block carries an
+  // accurate one), which keeps repeated runs byte-identical.
+  // Flush the last provider: the loop only stores a block when the *next*
+  // provider key shows up, so a single-provider block used to parse to an
+  // empty Map (and its providers were then dropped on write).
   if (curKey) out.set(curKey, curLines.join('\n'));
+
+  // Normalise every stored block to the 4-space provider depth the merge
+  // machinery emits, then drop trailing blank/comment lines.
+  const trimmed = [];
+  for (const [id, text] of out) {
+    const kept = text.split('\n').map((l) => (l.trim() === '' ? '' : ' '.repeat(4 - baseIndent) + l));
+    while (kept.length > 1 && /^\s*(#.*)?$/.test(kept[kept.length - 1])) kept.pop();
+    trimmed.push([id, kept.join('\n')]);
+  }
+  const out2 = new Map(trimmed);
   // A block that has provider lines but none parsed -> don't clobber it.
-  return out;
+  return out2;
 }
 
 // A provider that already exists in settings.yaml but was not reachable this
@@ -237,7 +271,185 @@ function annotateKeptProvider(id, text) {
   return [lines[0], '      # probe: unreachable', ...lines.slice(1)].join('\n');
 }
 
-function mergeSettings(existingText, newProviders, defaultModel) {
+/** Providers declared in a patch entry's `config:` body. The patch may indent
+ * its entry with four spaces (as the shipped patches and the web UI do) or
+ * with two, so the body is re-normalised to the settings shape first: an
+ * absolute-indent parser would see the provider keys at the wrong depth and
+ * return an empty map, which silently dropped providers that only exist in the
+ * patch. Returns null when the body declares no providers. */
+function parsePatchProviders(conceptText) {
+  if (!conceptText) return null;
+  const lines = conceptText.replace(/\r\n/g, '\n').split('\n');
+  let start = -1;
+  let bodyIndent = Infinity;
+  for (let i = 0; i < lines.length; i++) {
+    if (!lines[i].trim()) continue;
+    if (start < 0) {
+      const key = /^([A-Za-z0-9_.-]+):\s*$/.exec(lines[i].trim());
+      if (key && key[1] === 'providers' && !lines[i].startsWith(' ')) { start = i + 1; continue; }
+      return null; // first top-level key is not `providers:` -> not our shape
+    }
+    bodyIndent = Math.min(bodyIndent, /^ */.exec(lines[i])[0].length);
+  }
+  if (start < 0 || bodyIndent === Infinity) return null;
+  // Re-indent to the shape the merge machinery emits and consumes: 4 spaces
+  // for a provider key, 6 for its fields (`emitProvider` builds exactly that).
+  // Emitting a block that kept its original depth produced invalid YAML —
+  // `auto-extra3:` landed beside `providers:` instead of under it.
+  const normalized = [`providers:`];
+  for (const line of lines.slice(start)) {
+    if (!line.trim()) continue;
+    normalized.push('  ' + line.slice(bodyIndent));
+  }
+  return parseProvidersBlock(normalized.join('\n'), 2);
+}
+
+/** A comment that only marks a section boundary, e.g. `# --- keep this fence ---`.
+ * Ordinary `# note` comments are NOT fences: they stay inside the entry block. */
+function isFenceComment(line) {
+  const body = line.replace(/^\s*#+\s*/, '').trim();
+  return body.endsWith('#') ? isFenceComment(body) : /^[-=*_ ]{3,}$/.test(body);
+}
+
+/** Split a profile patch into its comment banner, its `- id:` entry blocks and
+ * the comment trailer after the last entry. Each entry keeps its own `- id:`
+ * line so a rewrite reproduces the block verbatim. Returns null when the
+ * document is not a top-level patch array. */
+function readPatchEntries(text) {
+  if (!text.trim()) return { header: '', entries: [], trailer: '' };
+  const lines = text.replace(/\r\n/g, '\n').split('\n');
+  const entries = [];
+  let header = '';
+  let trailer = '';
+  let cur = null;
+  let inTrailer = false;
+  for (const line of lines) {
+    if (!inTrailer) {
+      const m = /^-\s+id:\s*([A-Za-z0-9_.-]+)\s*$/.exec(line);
+      if (m) {
+        cur = { id: m[1], lines: [line] };
+        entries.push(cur);
+        continue;
+      }
+      if (!cur && /^-/.test(line)) return null; // not a patch array we understand
+    }
+    if (cur) {
+      // Only a fence comment ends the entry list. Any earlier comment line
+      // belongs to the entry block it sits in: treating every comment as the
+      // trailer would stop recognising later `- id:` lines and then append a
+      // duplicate entry, silently overriding the user's own choice.
+      if (isFenceComment(line)) { inTrailer = true; trailer += (trailer ? '\n' : '') + line; }
+      else cur.lines.push(line);
+      continue;
+    }
+    header += (header ? '\n' : '') + line;
+  }
+  return { header: header.replace(/^\n+/, ''), entries, trailer };
+}
+
+/** `config:` body of one entry, dedented to the settings-section shape. Footer
+ * lines and inline configs come back as their raw text. The body is located by
+ * the entry's own indent width — the shipped patches indent entries with four
+ * spaces, other authors use two, and a hard-coded assumption silently dropped
+ * the whole body (and with it every provider it declared). */
+function patchEntryConcept(entry) {
+  const lines = entry.lines;
+  let idx = -1;
+  for (let i = 0; i < lines.length; i++) {
+    if (/^ *(?:config):\s*$/.test(lines[i])) { idx = i; break; }
+  }
+  if (idx < 0) return null;
+  const configIndent = /^ */.exec(lines[idx])[0].length;
+  let bodyIndent = Infinity;
+  for (let i = idx + 1; i < lines.length; i++) {
+    if (!lines[i].trim()) continue;
+    bodyIndent = Math.min(bodyIndent, /^ */.exec(lines[i])[0].length);
+  }
+  // Inline body (`config: {...}`) or an empty body: nothing to work with.
+  if (bodyIndent === Infinity || bodyIndent <= configIndent) {
+    const inline = lines[idx].slice(configIndent + 'config:'.length).trim();
+    return inline ? inline + '\n' : null;
+  }
+  const out = [];
+  for (let i = idx + 1; i < lines.length; i++) {
+    const line = lines[i];
+    if (!line.trim()) { out.push(''); continue; }
+    const indent = /^ */.exec(line)[0].length;
+    if (indent < bodyIndent) break;
+    out.push(line.slice(bodyIndent));
+  }
+  return out.join('\n').replace(/\s+$/, '\n');
+}
+
+/** Dedent every non-empty line by `n` spaces; lines that cannot take it are
+ * left alone. Used to move between the 2-space settings shape and the 4-space
+ * `config:` body of a patch entry. */
+function dedentBy(lines, n) {
+  const pad = ' '.repeat(n);
+  return lines.map((l) => (l.startsWith(pad) ? l.slice(n) : l));
+}
+
+function patchEntryName(entry) {
+  for (const line of entry.lines) {
+    const m = /^ {2}name:\s*(.+?)\s*$/.exec(line);
+    if (m) return m[1];
+  }
+  return null;
+}
+
+/** True when the patch already declares a usable agent-default-model. */
+function patchHasModel(parsed, key) {
+  const entry = parsed.entries.find((e) => e.id === 'agent-default-model');
+  if (!entry) return false;
+  for (const line of entry.lines) {
+    if (new RegExp('^ {4}' + key + ':\\s*\\S').test(line)) return true;
+  }
+  return false;
+}
+
+/** Entry for `id`, rendered: `- id:` / `  name:` / `  config:` + the merged
+ * settings section indented by four spaces. `pkg` may be null when the entry
+ * does not need a `name:` (config-only override of a bundle entry). */
+function patchEntryBlock(id, pkg, conceptText) {
+  let out = `- id: ${id}\n`;
+  // Quote the package name: a bare `@scope/name` is invalid YAML (an
+  // indicator at the start of a scalar), and the shipped patches quote it too.
+  if (pkg) out += `  name: ${yamlStr(pkg)}\n`;
+  out += '  config:\n';
+  for (const line of conceptText.split('\n')) {
+    if (line === '') continue;
+    out += '    ' + line + '\n';
+  }
+  return out;
+}
+
+function patchEntryLines(block) {
+  return block.replace(/\n$/, '').split('\n');
+}
+
+function renderPatchDocument(parsed) {
+  const chunks = [];
+  const header = (parsed.header || '').replace(/\s+$/, '');
+  if (header.trim()) chunks.push(header);
+  for (const e of parsed.entries) {
+    const chunk = e.lines.join('\n').replace(/\s+$/, '');
+    if (chunk.trim()) chunks.push(chunk);
+  }
+  let doc = chunks.join('\n\n') + '\n';
+  const trailer = (parsed.trailer || '').replace(/\s+$/, '');
+  if (trailer.trim()) doc += '\n' + trailer + '\n';
+  return doc.replace(/\n{3,}/g, '\n\n');
+}
+
+/** Replace the `id` entry in place, or append it before the trailing fence. */
+function upsertPatchEntry(parsed, id, pkg, conceptText) {
+  const block = patchEntryBlock(id, pkg, conceptText);
+  const existing = parsed.entries.find((e) => e.id === id);
+  if (existing) existing.lines = patchEntryLines(block);
+  else parsed.entries.push({ id, lines: patchEntryLines(block) });
+}
+
+function mergeSettings(existingText, newProviders, defaultModel, legacyText, patchText) {
   const { sections, preamble } = readTopLevelSections(existingText);
 
   let llmBlock = null;
@@ -282,7 +494,26 @@ function mergeSettings(existingText, newProviders, defaultModel) {
     body += defaultBlock.text + '\n';
   }
 
+  // Providers already declared live in the profile patch, not in this
+  // settings-shaped document, so seed from the patch first: a provider whose
+  // server is merely down this run must survive as `# probe: unreachable`
+  // instead of being dropped. Then fold in a pre-0.2 settings.yaml (or its
+  // renamed .imported twin) so the first run after the upgrade carries those
+  // over too. Patch wins when both declare the same id.
   const preserved = new Map();
+  const seed = (parsed) => { if (parsed) for (const [k, v] of parsed) if (!preserved.has(k)) preserved.set(k, v); };
+  const patchParsed = readPatchEntries(patchText);
+  if (patchParsed) {
+    const entry = patchParsed.entries.find((e) => e.id === 'llm-pi-ai');
+    const concept = entry ? patchEntryConcept(entry) : null;
+    // Patch config bodies use the entry's own indent width, so they need the
+    // relative parser; parseProvidersBlock only understands settings sections.
+    if (concept) seed(parsePatchProviders(concept));
+  }
+  if (legacyText && legacyText.trim()) {
+    const legacy = readTopLevelSections(legacyText).sections.find((s) => s.key === 'llm-pi-ai');
+    if (legacy) seed(parseProvidersBlock(legacy.text));
+  }
   let unexpectedShape = false;
   if (llmBlock) {
     const parsed = parseProvidersBlock(llmBlock.text);
@@ -506,7 +737,14 @@ async function main() {
     }
   }
 
-  const settingsText = fs.existsSync(SETTINGS) ? fs.readFileSync(SETTINGS, 'utf8') : '';
+  // Live config lives in the profile patch from dsh 0.2 on. Read it when it
+  // exists; also fold in a pre-0.2 settings.yaml / settings.yaml.imported once
+  // so providers a previous version wrote there survive the upgrade.
+  const patchText = fs.existsSync(PATCH) ? fs.readFileSync(PATCH, 'utf8') : '';
+  let legacyText = '';
+  for (const candidate of [SETTINGS, SETTINGS + '.imported']) {
+    if (fs.existsSync(candidate)) { legacyText = fs.readFileSync(candidate, 'utf8'); break; }
+  }
 
   // Determine default model: first auto-detected provider with at least one
   // model, preferring the one declared in DSH_EXTRA_ENDPOINTS (auto-extra1).
@@ -529,16 +767,39 @@ async function main() {
     console.log(`Default model: ${defaultModel.provider} / ${defaultModel.model}`);
   }
 
-  let next;
-  if (!settingsText.trim()) {
-    next = emitProvidersBlock(providers);
-    if (defaultModel) {
-      next = `agent-default-model:\n  provider: ${defaultModel.provider}\n  model: ${yamlStr(defaultModel.model)}\n\n` + next;
-    }
+  const merged = mergeSettings(patchText, providers, defaultModel, legacyText, patchText);
+
+  const parsedPatch = readPatchEntries(patchText);
+  if (parsedPatch === null) {
+    console.log('  (profile patch is not a top-level list of `- id:` entries; left untouched)');
   } else {
-    next = mergeSettings(settingsText, providers, defaultModel);
+    const parsedMerged = readTopLevelSections(merged).sections;
+    const bodyOf = (key) => {
+      const sec = parsedMerged.find((s) => s.key === key);
+      if (!sec) return null;
+      const bodyLines = sec.text.split('\n').slice(1);
+      return dedentBy(bodyLines, 2).join('\n').replace(/\s+$/, '\n');
+    };
+    const llmBody = bodyOf('llm-pi-ai');
+    if (llmBody) upsertPatchEntry(parsedPatch, 'llm-pi-ai', "@deepseek-ai/dsh-llm-pi-ai", llmBody);
+    else console.log('  (llm-pi-ai section missing from the merged document; providers not written)');
+    // Only supply a fallback default model when the profile has none: the
+    // patch shipped with the deployment usually picks deepseek-official, and
+    // auto-detection must not silently override a deliberate choice.
+    if (defaultModel && !patchHasModel(parsedPatch, 'model')) {
+      const defBody = bodyOf('agent-default-model');
+      if (defBody) {
+        upsertPatchEntry(parsedPatch, 'agent-default-model', "@deepseek-ai/dsh-agent-default-model", defBody);
+        console.log(`  Default model fallback written: ${defaultModel.provider} / ${defaultModel.model}`);
+      }
+    }
+    fs.mkdirSync(PROFILE_DIR, { recursive: true });
+    if (patchText.trim()) {
+      const backup = `${PATCH}.auto-backup-${Date.now()}`;
+      try { fs.copyFileSync(PATCH, backup); } catch {}
+    }
+    writeFileAtomic(PATCH, renderPatchDocument(parsedPatch).replace(/\s+$/, '\n'), 0o644);
   }
-  writeFileAtomic(SETTINGS, next.replace(/\s+$/, '\n'), 0o644);
 
   // Summary
   const keys = Object.keys(providers);
@@ -553,7 +814,7 @@ async function main() {
     console.log('No local model server detected. Start Ollama / LM Studio / llama.cpp / vLLM,');
     console.log('then run start.bat again. (DeepSeek API works via DEEPSEEK_API_KEY.)');
   }
-  console.log(`Settings written: ${SETTINGS}`);
+  console.log(`Profile patch written: ${PATCH}`);
 }
 
 main().catch((e) => {

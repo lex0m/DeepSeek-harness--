@@ -17,6 +17,11 @@ if (-not $env:LOCALAPPDATA) { $env:LOCALAPPDATA = "$env:USERPROFILE\AppData\Loca
 if (-not $env:HOME) { $env:HOME = $env:USERPROFILE }
 if (-not $env:TEMP) { $env:TEMP = "$env:LOCALAPPDATA\Temp" }
 
+# dsh 版本/通道：默认 npm latest（目前 0.2.0-rc.2）；要跟随 alpha 通道或钉死版本，
+# 在 config\user.env 里写一行 DSH_VERSION=0.2.1-alpha.2（或 alpha / next / 精确版本号）。
+$DshTag = if ($env:DSH_VERSION) { $env:DSH_VERSION } else { 'latest' }
+$DshSpec = "@deepseek-ai/dsh@$DshTag"
+
 $ToolsDir  = Join-Path $Root 'tools'
 $NodeDir   = Join-Path $ToolsDir 'node'
 $NodeExe   = Join-Path $NodeDir 'node.exe'
@@ -60,8 +65,8 @@ if ($LASTEXITCODE -ne 0) {
   Write-Host '  (approve-scripts not available or nothing pending - continuing)' -ForegroundColor DarkGray
 }
 
-Write-Step 'Updating @deepseek-ai/dsh ...'
-$code = Invoke-Npm @('install', '@deepseek-ai/dsh@latest', '--force', '--no-fund', '--no-audit', '--foreground-scripts')
+Write-Step "Updating $DshSpec ..."
+$code = Invoke-Npm @('install', $DshSpec, '--force', '--no-fund', '--no-audit', '--foreground-scripts')
 if ($code -ne 0) { throw "update failed (code $code)." }
 
 # 重新补装可能新增的 peer 依赖 (cordis 插件体系依赖 peerDependencies)
