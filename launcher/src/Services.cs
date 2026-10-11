@@ -313,7 +313,14 @@ namespace DeepSeekHarnessLauncher
             return State == ServerState.Running && Util.IsPortListening(Port);
         }
 
-        // 若 user.env 配置了 DSH_PERMISSION，且 dsh settings.yaml 尚无权限配置，则写入默认权限。
+        // 若 user.env 配置了 DSH_PERMISSION，则写进 dsh 当前真正读取的配置文件。
+        //
+        // dsh >= 0.2 把活配置从 $DSH_HOME/settings.yaml 搬到了
+        // $DSH_HOME/profiles/<profile>/cordis.patch.yml（`- id:` 数组）；settings.yaml 只在首次启动
+        // 被导入一次，且只认 ui-*/shell 几个 section，自造的 permissionPresets 会被忽略。
+        // 旧写法继续写 settings.yaml，会让 DSH_PERMISSION 在 0.2+ 上静默失效（新会话回落到
+        // workspace-write + ask）。所以：profile patch 存在 => 补/更新 `permission` 条目的
+        // config.defaultPreset，其它字节不动；否则退回旧写法，保证 0.1.x 仍可用。
         // 仅在“完全没有权限配置”时写入一次，用户在 dsh UI 内改过的选择不会被覆盖。
         private void EnsureDshPermission()
         {
@@ -322,15 +329,149 @@ namespace DeepSeekHarnessLauncher
                 var cfg = new ConfigManager(Paths.UserEnv);
                 string perm = cfg.Get("DSH_PERMISSION", "").Trim();
                 if (string.IsNullOrEmpty(perm)) return;
+
+                string patch = ProfilePatchPath();
+                if (patch != null && File.Exists(patch))
+                {
+                    string text = File.ReadAllText(patch, System.Text.Encoding.UTF8);
+                    if (PatchHasPermissionDefault(text)) return;   // 尊重既有选择
+                    string next;
+                    if (TryUpsertPermissionPreset(text, perm, out next))
+                    {
+                        string backup = patch + ".perm-backup-" + DateTime.Now.ToString("yyyyMMdd-HHmmss");
+                        try { File.Copy(patch, backup, true); } catch { }
+                        AtomicWriteAllText(patch, next);
+                        Emit("已写入 profile patch 默认权限：" + perm + " -> " + patch);
+                    }
+                    else
+                    {
+                        Emit("profile patch 结构无法识别，未改动权限（请手动设置）：" + patch);
+                    }
+                    return;
+                }
+
+                // 旧版（0.1.x）：settings.yaml 就是活配置
                 string settings = Path.Combine(Paths.DshHome, "settings.yaml");
                 if (!File.Exists(settings)) return;
                 string yaml = File.ReadAllText(settings, System.Text.Encoding.UTF8);
-                if (yaml.Contains("permissionPresets")) return; // 已配置则尊重现有选择
-                string add = "\npermissionPresets:\n  defaultPreset: " + perm + "\n";
-                File.AppendAllText(settings, add, new System.Text.UTF8Encoding(false));
-                Emit("已设置 dsh 默认权限模式：" + perm);
+                if (yaml.Contains("permissionPresets")) return;
+                File.AppendAllText(settings,
+                    "\npermissionPresets:\n  defaultPreset: " + perm + "\n",
+                    new System.Text.UTF8Encoding(false));
+                Emit("已设置 dsh 默认权限模式（settings.yaml，旧版）：" + perm);
             }
             catch { }
+        }
+
+        // profile patch 路径：优先 web，其次唯一的那个 profile。找不到返回 null。
+        private static string ProfilePatchPath()
+        {
+            string profiles = Path.Combine(Paths.DshHome, "profiles");
+            if (!Directory.Exists(profiles)) return null;
+            string web = Path.Combine(profiles, "web", "cordis.patch.yml");
+            if (File.Exists(web)) return web;
+            try
+            {
+                string[] dirs = Directory.GetDirectories(profiles);
+                if (dirs.Length == 1)
+                {
+                    string p = Path.Combine(dirs[0], "cordis.patch.yml");
+                    if (File.Exists(p)) return p;
+                }
+            }
+            catch { }
+            return null;
+        }
+
+        // 已有 defaultPreset（不论在哪条 id 下）或旧格式残留，都算用户已配置。
+        private static bool PatchHasPermissionDefault(string text)
+        {
+            if (string.IsNullOrEmpty(text)) return false;
+            if (text.Contains("permissionPresets")) return true;
+            foreach (string line in text.Replace("\r\n", "\n").Split('\n'))
+            {
+                if (line.TrimStart().StartsWith("defaultPreset:")) return true;
+            }
+            return false;
+        }
+
+        // 在 patch 里补/更新 `- id: permission` 条目的 config.defaultPreset。
+        // 逐行处理，只动该条目；false 表示结构不是我们认识的那种（调用方不改文件）。
+        private static bool TryUpsertPermissionPreset(string text, string perm, out string result)
+        {
+            result = text;
+            if (text == null || text.Trim().Length == 0) return false;
+            string nl = text.IndexOf("\r\n") >= 0 ? "\r\n" : "\n";
+            List<string> lines = new List<string>(text.Replace("\r\n", "\n").Split('\n'));
+
+            int start = -1;
+            for (int i = 0; i < lines.Count; i++)
+            {
+                if (lines[i].TrimEnd() == "- id: permission") { start = i; break; }
+            }
+            if (start < 0)
+            {
+                int end = lines.Count;
+                while (end > 0 && lines[end - 1].Trim().Length == 0) end--;
+                if (end > 0 && lines[end - 1].Trim().Length != 0) lines.Insert(end++, ""); // 空行分隔，便于阅读
+                lines.Insert(end, "- id: permission");
+                lines.Insert(end + 1, "  name: \"@deepseek-ai/dsh-permission-presets\"");
+                lines.Insert(end + 2, "  config:");
+                lines.Insert(end + 3, "    defaultPreset: " + perm);
+                result = string.Join(nl, lines.ToArray());
+                return true;
+            }
+
+            int entryEnd = lines.Count;
+            for (int i = start + 1; i < lines.Count; i++)
+            {
+                if (lines[i].StartsWith("- ")) { entryEnd = i; break; }
+            }
+
+            int cfgAt = -1;
+            for (int i = start + 1; i < entryEnd; i++)
+            {
+                if (lines[i].TrimEnd() == "  config:") { cfgAt = i; break; }
+            }
+            if (cfgAt < 0)
+            {
+                int nameAt = -1;
+                for (int i = start + 1; i < entryEnd; i++)
+                {
+                    if (lines[i].TrimStart().StartsWith("name:")) { nameAt = i; break; }
+                }
+                int at = nameAt >= 0 ? nameAt + 1 : start + 1;
+                lines.Insert(at, "  config:");
+                lines.Insert(at + 1, "    defaultPreset: " + perm);
+            }
+            else
+            {
+                int dp = -1;
+                for (int i = cfgAt + 1; i < entryEnd; i++)
+                {
+                    string s = lines[i].TrimStart();
+                    if (s.Length == 0) continue;
+                    if (lines[i].Length > 0 && lines[i][0] != ' ') break; // 条目结束
+                    if (s.StartsWith("defaultPreset:"))
+                    {
+                        lines[i] = "    defaultPreset: " + perm;
+                        dp = i;
+                        break;
+                    }
+                }
+                if (dp < 0) lines.Insert(cfgAt + 1, "    defaultPreset: " + perm);
+            }
+            result = string.Join(nl, lines.ToArray());
+            return true;
+        }
+
+        // 原子写文本：同目录临时文件 + File.Replace，避免便携盘中途拔出留下半截文件。
+        private static void AtomicWriteAllText(string path, string content)
+        {
+            string tmp = path + ".tmp";
+            File.WriteAllText(tmp, content, new System.Text.UTF8Encoding(false));
+            try { File.Replace(tmp, path, null); }
+            catch { File.Copy(tmp, path, true); File.Delete(tmp); }
         }
 
         // 端口自动探测：从首选端口起，返回第一个空闲端口（避免硬编码 3080 被占用）

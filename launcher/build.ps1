@@ -36,7 +36,8 @@ $RefArgs = @()
 foreach ($r in $Refs) { $RefArgs += "/reference:$r" }
 
 Write-Host "==> Compiling DeepSeekHarness.exe [asInvoker] ..."
-& $Csc /nologo /target:winexe /platform:x64 /optimize+ /win32manifest:"$Manifest" /out:$Out $RefArgs $Sources
+# /deterministic: 相同输入产出相同 exe（PE 时间戳/MVID 固定），便于比对与回滚
+& $Csc /nologo /target:winexe /platform:x64 /optimize+ /deterministic /win32manifest:"$Manifest" /out:$Out $RefArgs $Sources
 if ($LASTEXITCODE -ne 0) { throw "Compile failed with code $LASTEXITCODE" }
 
 Write-Host "==> Done: $Out ($((Get-Item $Out).Length) bytes)"
